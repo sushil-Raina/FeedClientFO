@@ -185,11 +185,6 @@ typedef struct
 
 
 
-
-
-
-
-
 #pragma pack(push, 1)
 typedef struct
 {
@@ -215,16 +210,18 @@ typedef struct
 
 typedef struct
 {
-	long lToken;
+	long    lToken;
+	SendPkt SndPkt;
+	volatile long Status; //[1 : Info changed and Updated, Reader can read] [0 : Info already readed or Server is updating/UpdatingAgain]
 	volatile long SubsFlag;
 }ContractInfo;
 
 
-ContractInfo *pContract = NULL;
-CRITICAL_SECTION  TCPCrit ;
- 
 #pragma pack(pop)
- 
+
+
+ContractInfo *pContract = NULL;
+CRITICAL_SECTION  TCPCrit;
 volatile long MTSFClose = 0;
 volatile long FClose = 0;
 WSADATA ws;
@@ -232,19 +229,19 @@ WSADATA ws;
 HANDLE hCatch = NULL;
 HANDLE hSendEvent = NULL;
 HANDLE hMulticast = NULL;
- 
-int MaxToken = 0;
+
 SOCKET  Sock;
 struct sockaddr_in name;
 unsigned char ttl = 2;
 unsigned long ReTime = 500;
 BOOL bAllow = TRUE;
 
- 
-#define   SIZE__SENDPKT_QUEUE  10000
-int SndPktA_Head = -1, SndPktA_Tail = -1;
-SendPkt   SndPktArr[SIZE__SENDPKT_QUEUE];
- 
+
+#define   SIZE__SENDPKT_QUEUE  100000
+int MaxToken = 150000;
+volatile long SndPktA_Head = -1, SndPktA_Tail = -1;
+int Que_TknNmbrs[SIZE__SENDPKT_QUEUE];
+
 
 
 DWORD WINAPI Multicast(LPVOID pArg)
@@ -369,7 +366,7 @@ PacketLoop:
 
 int __inline SendPacket(SOCKET ConnectSocket, char *Buffer, int Size)
 {
-	
+
 	int Absorbed = 0;
 PacketLoop:
 	int sendpacket = send(ConnectSocket, Buffer + Absorbed, Size - Absorbed, 0);
@@ -386,7 +383,7 @@ PacketLoop:
 		goto PacketLoop;
 	}
 
-	
+
 	return  0;
 }
 
@@ -409,6 +406,8 @@ DWORD WINAPI SockThread(LPVOID pArg)
 		return 1;
 	}
 
+
+ScktConnect:
 	pServerInfo->Socket = INVALID_SOCKET;
 	pServerInfo->Socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (pServerInfo->Socket == INVALID_SOCKET)
@@ -426,8 +425,13 @@ DWORD WINAPI SockThread(LPVOID pArg)
 	if (SOCKET_ERROR == connect(pServerInfo->Socket, (SOCKADDR*)&SockAdder, sizeof(SockAdder)))
 	{
 		SockError = WSAGetLastError();
+		printf("\rRetrying for connect... [ErrCode : %d]", SockError);
+		closesocket(pServerInfo->Socket);
+		pServerInfo->Socket = NULL;
+		Sleep(1000);
+		goto ScktConnect;
 	}
-	
+
 	memset(Buffer, 0, sizeof(Buffer));
 
 	PktHeader sHeader;
@@ -436,10 +440,10 @@ DWORD WINAPI SockThread(LPVOID pArg)
 	sHeader.MagicNumber = 0xDD;
 	sHeader.PacketType = 1;
 
-	ssInit sInit; 
+	ssInit sInit;
 	memset(&sInit, 0, sizeof(sInit));
-	sInit.TerminalType = TERMINAL_TYPE_NSE_FO_FEED;    
-	
+	sInit.TerminalType = TERMINAL_TYPE_NSE_FO_FEED;
+
 	SendPacket(pServerInfo->Socket, (char *)&sHeader, sizeof(sHeader));
 	SendPacket(pServerInfo->Socket, (char *)&sInit, sizeof(sInit));
 
@@ -451,7 +455,7 @@ Loop:
 		int recvLen = RecvPacketHeader(pServerInfo->Socket, (char *)&sHeader, sizeof(sHeader));
 
 		// ----------------    queue work 
-				
+
 
 		if (recvLen == -1) // When NOT RECEIVED ANY PACKET 
 		{
@@ -459,38 +463,40 @@ Loop:
 			{
 				//Send all packets from buffer 
 				{
-					int Tmp_Front = SndPktA_Head;
-					int Tmp_Tail = SndPktA_Tail;
+					int  Tmp_Front = SndPktA_Head;
+					int  Tmp_Tail = SndPktA_Tail;
+
+
+					//volatile long InterlockedExchange(&SndPktA_Head, SndPktA_Head);  // ; 
+					//volatile long InterlockedExchange(&SndPktA_Tail, SndPktA_Tail);  // ;
+
+
 
 				SendNextPaket:
 
 					if (Tmp_Front != Tmp_Tail)
 					{
 						Tmp_Front = (Tmp_Front + 1) % SIZE__SENDPKT_QUEUE;
+						volatile long  lStatus = 0; //[0 : Readed] [1 : Reading] [2 : Writing] [3 : Written]
+						lStatus = InterlockedExchange(&(pContract + Que_TknNmbrs[Tmp_Front] - 1)->Status, (pContract + Que_TknNmbrs[Tmp_Front] - 1)->Status);
 
- 
-						if (   SndPktArr[Tmp_Front].TokenNo == 115
-							|| SndPktArr[Tmp_Front].TokenNo == 219001
-							|| SndPktArr[Tmp_Front].TokenNo == 220366
-							|| SndPktArr[Tmp_Front].TokenNo == 221598
-							|| SndPktArr[Tmp_Front].TokenNo == 224571
-							)
+						if (lStatus == 3)
 						{
-							printf("FO_Client %d  %ld\t[%d %d]\n", SndPktArr[Tmp_Front].TokenNo, SndPktArr[Tmp_Front].CloseTick, SndPktA_Head, SndPktA_Tail);
+							InterlockedExchange(&(pContract + Que_TknNmbrs[Tmp_Front] - 1)->Status, 1);
+
+							sHeader.PacketType = 0x9;
+							SendPacket(sServerInfo.Socket, (char *)&sHeader, sizeof(sHeader));
+							SendPacket(sServerInfo.Socket, (char *)&((pContract + Que_TknNmbrs[Tmp_Front] - 1)->SndPkt), sizeof(SendPkt));
+
+							InterlockedExchange(&(pContract + Que_TknNmbrs[Tmp_Front] - 1)->Status, 0);
 						}
 
-
-
-						sHeader.PacketType = 0x9;
-						SendPacket(sServerInfo.Socket, (char *)&sHeader, sizeof(sHeader));
-						SendPacket(sServerInfo.Socket, (char *)&SndPktArr[Tmp_Front], sizeof(SendPkt));
-
-
+						SndPktA_Head = Tmp_Front; // InterlockedExchange(&SndPktA_Head, Tmp_Front); //
+						printf("FO_Client   %5d  %10.4f    [%6d %6d]  [%ld]\n", (pContract + Que_TknNmbrs[Tmp_Front] - 1)->SndPkt.TokenNo, (pContract + Que_TknNmbrs[Tmp_Front] - 1)->SndPkt.CloseTick / 10000.0, Tmp_Front, Tmp_Tail, lStatus);
 
 						goto SendNextPaket;
 					}
 
-					SndPktA_Head = Tmp_Tail;
 				}
 
 			}
@@ -650,7 +656,7 @@ Loop:
 
 				break;
 			}
-	}
+		}
 
 		goto Loop;
 	}
@@ -670,15 +676,15 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 
 	sHeader.MagicNumber = 0xDD;
 	sHeader.PacketType = 0x9;
-	
+
 	//===================================
 
 
 	SOCKET Socket;
 
+	SendPkt  *SndPkt;
 
-
-	IP_MREQ  Broadcast;
+	IP_MREQ     Broadcast;
 	sockaddr_in SenderAddr;
 	sockaddr_in local;
 	// SendPkt   sSendPkt;
@@ -693,17 +699,11 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 
 	BCAST_HEADER         *BcastHeader = NULL;
 	MS_BCAST_ONLY_MBP    *MBPPacket = (MS_BCAST_ONLY_MBP*)(oPacket + 8);
-	MS_TICKER_TRADE_DATA *BCTPacket = NULL;
-	MS_BCAST_INQ_RESP_2  *MBIPacket = NULL;
-	CM_ASSSET_OI         *CAOPacket = NULL;
 	int SenderAddrSize;
 
 	SYSTEMTIME Time;
-
 	lzo_uint oLen;
-	double lCloseTick = 0;
-	char sCloseTick[100] = "";
-	
+
 
 	memset(&SenderAddr, 0, sizeof(SenderAddr));
 	memset(&Broadcast, 0, sizeof(Broadcast));
@@ -714,7 +714,6 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 	local.sin_port = htons(34330);   //  future //
 
 									 // local.sin_port = 6791;     //// *** currency *** ////
-
 	inet_pton(AF_INET, "233.1.2.5", &Broadcast.imr_multiaddr.s_addr); //"233.1.2.5"//293.255.255.255
 	setsockopt(Socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&optval, sizeof(optval));
 	setsockopt(Socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *)&Broadcast, sizeof(Broadcast));
@@ -724,9 +723,9 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 
 	RP_MARKET_STATS   *RPMSPacket = (RP_MARKET_STATS *)(CmpPacket + 8);
 
+
+
 	GetLocalTime(&Time);
-
-
 	if (bind(Socket, (SOCKADDR*)&local, sizeof(local)) != SOCKET_ERROR)
 	{
 	PACKETLOOP:
@@ -737,7 +736,6 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 		{
 
 		case  0x02:
-
 			Packet->iNoPackets = htons(Packet->iNoPackets);
 			CmpPacket->iCompLen = htons(CmpPacket->iCompLen);
 
@@ -755,23 +753,26 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 
 
 			BcastHeader->TransactionCode = htons(BcastHeader->TransactionCode);
-
-
 			switch (BcastHeader->TransactionCode)
-			{ 
+			{
 			case 7208:
 
 				MBPPacket->NoOfRecords = htons(MBPPacket->NoOfRecords);
-
 				for (long i = 0; i < MBPPacket->NoOfRecords; i++)
 				{
-
 					MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token);
+
+					if (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token < 0 || MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token > MaxToken)
+					{
+						//ReAlloc SndPkts4AllTkns wrt CurrentToken, and then load the pkt details remove this continue.
+						continue;
+					}
+
 					MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradedPrice = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradedPrice);
 					MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeTime = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeTime);
 					MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeTime += 315513000;
 
-					if (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeTime < 315513000 || MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token < 0 || MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token > MaxToken)
+					if (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeTime < 315513000)
 					{
 						continue;
 					}
@@ -793,86 +794,80 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 
 					//if (SendKey == true)
 					{
-
 						// Check here, if not subscribed then donot allow to enter in the queue						
 						volatile long  lSubsFlag = 0;
 						lSubsFlag = InterlockedExchange(&(pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->SubsFlag, (pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->SubsFlag);
 
-
 						if (lSubsFlag == 1)
 						{
-							//---------------------------------
+							volatile long  lStatus = 0; //[0 : Readed] [1 : Reading] [2 : Writing] [3 : Written]
+							lStatus = InterlockedExchange(&(pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->Status, (pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->Status);
 
-							if (((SndPktA_Tail + 1) == SndPktA_Head)
-								||
-								(SndPktA_Head == 0 && SndPktA_Tail == (SIZE__SENDPKT_QUEUE - 1))
-							)
-							{//The queue is full
-							 //ReAlloc and increase the size
-							 //PENDING Change to dynamic array
-							 // For Dynamic array Set FIXED_FOR_ALL_PKTS items also 
-								return -1;
-							}
-
-							int Idx_Tail = (SndPktA_Tail + 1) % SIZE__SENDPKT_QUEUE;
-
-							//Populate the Fields
+							if (lStatus == 0 || lStatus == 3)
 							{
-
-								GetLocalTime(&LocalTime);
-								 
-
-
-								SndPktArr[Idx_Tail].CloseTick     =      (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradedPrice) * 100;    // Ltp/100.00            -do-
-
-								SndPktArr[Idx_Tail].OpenTick      = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].OpenPrice) * 100;
-								SndPktArr[Idx_Tail].HighTick      = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].HighPrice) * 100;
-								SndPktArr[Idx_Tail].LowTick       = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LowPrice) * 100;
-								SndPktArr[Idx_Tail].PreviousClose = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].ClosingPrice) * 100;
-								SndPktArr[Idx_Tail].TradeVolume   = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeQuantity);          // -1                    Ltq
-								SndPktArr[Idx_Tail].TotalVolume   = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].VolumeTradedToday);          // -1                    Tvt
-								SndPktArr[Idx_Tail].TokenNo       =      (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token);
-								 
-								// LastTradedPrice|OpenPrice|HighPrice|LowPrice|ClosingPrice|LastTradeQuantity|VolumeTradedToday|Token|lExpiryDate
-
-
-								MBP_INFORMATION *MBP = (MBP_INFORMATION *)&MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].MBPInfo;//  RecordBuffer;
-
-								//Pending
-								//PANKAJ : Check for PRice, multipy 100 required or not 
-
-								SndPktArr[Idx_Tail].BidSize[0] = htonl((MBP + 0)->Quantity);
-								SndPktArr[Idx_Tail].BidSize[1] = htonl((MBP + 1)->Quantity);
-								SndPktArr[Idx_Tail].BidSize[2] = htonl((MBP + 2)->Quantity);
-								SndPktArr[Idx_Tail].BidSize[3] = htonl((MBP + 3)->Quantity);
-								SndPktArr[Idx_Tail].BidSize[4] = htonl((MBP + 4)->Quantity);
-
-								SndPktArr[Idx_Tail].BidTick[0] = htonl((MBP + 0)->Price) * 100;
-								SndPktArr[Idx_Tail].BidTick[1] = htonl((MBP + 1)->Price) * 100;
-								SndPktArr[Idx_Tail].BidTick[2] = htonl((MBP + 2)->Price) * 100;
-								SndPktArr[Idx_Tail].BidTick[3] = htonl((MBP + 3)->Price) * 100;
-								SndPktArr[Idx_Tail].BidTick[4] = htonl((MBP + 4)->Price) * 100;
-
-								SndPktArr[Idx_Tail].AskSize[0] = htonl((MBP + 5)->Quantity);
-								SndPktArr[Idx_Tail].AskSize[1] = htonl((MBP + 6)->Quantity);
-								SndPktArr[Idx_Tail].AskSize[2] = htonl((MBP + 7)->Quantity);
-								SndPktArr[Idx_Tail].AskSize[3] = htonl((MBP + 8)->Quantity);
-								SndPktArr[Idx_Tail].AskSize[4] = htonl((MBP + 9)->Quantity);
-
-								SndPktArr[Idx_Tail].AskTick[0] = htonl((MBP + 5)->Price) * 100;
-								SndPktArr[Idx_Tail].AskTick[1] = htonl((MBP + 6)->Price) * 100;
-								SndPktArr[Idx_Tail].AskTick[2] = htonl((MBP + 7)->Price) * 100;
-								SndPktArr[Idx_Tail].AskTick[3] = htonl((MBP + 8)->Price) * 100;
-								SndPktArr[Idx_Tail].AskTick[4] = htonl((MBP + 9)->Price) * 100;
-
-								{
-									printf("%d, %15f    [%4d %4d] \n", SndPktArr[Idx_Tail].TokenNo, SndPktArr[Idx_Tail].CloseTick/10000.0, SndPktA_Head, SndPktA_Tail);
+								if (((SndPktA_Tail + 1) == SndPktA_Head)
+									||
+									(SndPktA_Head == 0 && SndPktA_Tail == (SIZE__SENDPKT_QUEUE - 1))
+									)
+								{//The queue is full
+									SndPktA_Head = -1;
 								}
 
+								InterlockedExchange(&(pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->Status, 2);
+								SndPkt = (&(pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->SndPkt);
+
+								//Populate the Fields
+								{
+									GetLocalTime(&LocalTime);
+
+									SndPkt->CloseTick = (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradedPrice) * 100;    // Ltp/100.00            -do-
+									SndPkt->OpenTick = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].OpenPrice) * 100;
+									SndPkt->HighTick = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].HighPrice) * 100;
+									SndPkt->LowTick = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LowPrice) * 100;
+									SndPkt->PreviousClose = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].ClosingPrice) * 100;
+									SndPkt->TradeVolume = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].LastTradeQuantity);          // -1                    Ltq
+									SndPkt->TotalVolume = ntohl(MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].VolumeTradedToday);          // -1                    Tvt
+									SndPkt->TokenNo = (MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token);
+
+									// LastTradedPrice|OpenPrice|HighPrice|LowPrice|ClosingPrice|LastTradeQuantity|VolumeTradedToday|Token|lExpiryDate
+
+
+									MBP_INFORMATION *MBP = (MBP_INFORMATION *)&MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].MBPInfo;//  RecordBuffer;
+
+																															   //Pending : Check for PRice, multipy 100 required or not  
+									SndPkt->BidSize[0] = htonl((MBP + 0)->Quantity);
+									SndPkt->BidSize[1] = htonl((MBP + 1)->Quantity);
+									SndPkt->BidSize[2] = htonl((MBP + 2)->Quantity);
+									SndPkt->BidSize[3] = htonl((MBP + 3)->Quantity);
+									SndPkt->BidSize[4] = htonl((MBP + 4)->Quantity);
+
+									SndPkt->BidTick[0] = htonl((MBP + 0)->Price) * 100;
+									SndPkt->BidTick[1] = htonl((MBP + 1)->Price) * 100;
+									SndPkt->BidTick[2] = htonl((MBP + 2)->Price) * 100;
+									SndPkt->BidTick[3] = htonl((MBP + 3)->Price) * 100;
+									SndPkt->BidTick[4] = htonl((MBP + 4)->Price) * 100;
+
+									SndPkt->AskSize[0] = htonl((MBP + 5)->Quantity);
+									SndPkt->AskSize[1] = htonl((MBP + 6)->Quantity);
+									SndPkt->AskSize[2] = htonl((MBP + 7)->Quantity);
+									SndPkt->AskSize[3] = htonl((MBP + 8)->Quantity);
+									SndPkt->AskSize[4] = htonl((MBP + 9)->Quantity);
+
+									SndPkt->AskTick[0] = htonl((MBP + 5)->Price) * 100;
+									SndPkt->AskTick[1] = htonl((MBP + 6)->Price) * 100;
+									SndPkt->AskTick[2] = htonl((MBP + 7)->Price) * 100;
+									SndPkt->AskTick[3] = htonl((MBP + 8)->Price) * 100;
+									SndPkt->AskTick[4] = htonl((MBP + 9)->Price) * 100;
+
+									//printf("%d, %15f    [%4d %4d] \n", SndPktArr[Idx_Tail].TokenNo, SndPktArr[Idx_Tail].CloseTick/10000.0, SndPktA_Head, SndPktA_Tail);
+
+								}
+
+								InterlockedExchange(&(pContract + MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token - 1)->Status, 3);
+								int Idx_Tail = (SndPktA_Tail + 1) % SIZE__SENDPKT_QUEUE;
+								Que_TknNmbrs[Idx_Tail] = MBPPacket->INTERACTIVE_ONLY_MBP_DATA[i].Token;
+								SndPktA_Tail = Idx_Tail;
 							}
-
-
-							SndPktA_Tail = Idx_Tail;
 						}
 					}
 
@@ -893,7 +888,6 @@ DWORD WINAPI CatchMulticast(LPVOID pArg)
 
 DWORD WINAPI ContractReader(LPVOID pArg)
 {
-	MaxToken = 150000;
 	pContract = (ContractInfo *)calloc(MaxToken, sizeof(ContractInfo));
 
 
@@ -914,7 +908,7 @@ DWORD WINAPI ContractReader(LPVOID pArg)
 	hCatch = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)&CatchMulticast, NULL, NULL, NULL);
 	WaitForSingleObject(hCatch, INFINITE);
 	WaitForSingleObject(hSock, INFINITE);
-	
+
 	CloseHandle(hSendEvent);
 	free(pContract);
 	return 0;
@@ -922,15 +916,19 @@ DWORD WINAPI ContractReader(LPVOID pArg)
 
 int main()
 {
+	HWND consoleWindow = GetConsoleWindow();
+	SetWindowPos(consoleWindow, 0, 1240, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+	//----------------------------
+
 	memset(&TCPCrit, 0, sizeof(TCPCrit));
 	InitializeCriticalSection(&TCPCrit);
 
 	WSAStartup(MAKEWORD(2, 2), &ws);
 
 	tHandle = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)&ContractReader, NULL, NULL, NULL);
-	WaitForSingleObject(tHandle,INFINITE);
+	WaitForSingleObject(tHandle, INFINITE);
 
 	DeleteCriticalSection(&TCPCrit);
-    return 0;
+	return 0;
 }
 
